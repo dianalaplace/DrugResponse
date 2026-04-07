@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+import glob
 import json
 import logging
+import os
 import pickle
 from pathlib import Path
 
@@ -46,6 +49,32 @@ FEATURE_INTERPRETATION = {
     "immune_exclusion": "Immune-excluded phenotype may predict reduced therapy response.",
     "M2_polarization": "M2-like macrophage polarization signals suppressive TME state.",
 }
+
+
+def _prepare_openmp_runtime() -> None:
+    """Best-effort setup for libomp on macOS before loading xgboost models."""
+    candidates = [
+        "/opt/miniconda3/lib/libomp.dylib",
+        "/opt/miniconda3/envs/iml/lib/libomp.dylib",
+    ]
+    candidates.extend(sorted(glob.glob("/opt/miniconda3/pkgs/llvm-openmp-*/lib/libomp.dylib"), reverse=True))
+
+    for lib_path in candidates:
+        if not Path(lib_path).exists():
+            continue
+        lib_dir = str(Path(lib_path).parent)
+        current = os.environ.get("DYLD_FALLBACK_LIBRARY_PATH", "")
+        paths = [p for p in current.split(":") if p]
+        if lib_dir not in paths:
+            os.environ["DYLD_FALLBACK_LIBRARY_PATH"] = ":".join([lib_dir] + paths)
+        try:
+            ctypes.CDLL(lib_path)
+            return
+        except OSError:
+            continue
+
+
+_prepare_openmp_runtime()
 
 
 def _load_json(path: Path) -> dict:

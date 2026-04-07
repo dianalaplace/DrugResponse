@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import ctypes
+import glob
 import json
 import logging
+import os
 import pickle
 from pathlib import Path
 
@@ -36,6 +39,32 @@ TME_FEATURES = {
     "immune_exclusion",
     "M2_polarization",
 }
+
+
+def _prepare_openmp_runtime() -> None:
+    """Best-effort setup for libomp on macOS before loading xgboost models."""
+    candidates = [
+        "/opt/miniconda3/lib/libomp.dylib",
+        "/opt/miniconda3/envs/iml/lib/libomp.dylib",
+    ]
+    candidates.extend(sorted(glob.glob("/opt/miniconda3/pkgs/llvm-openmp-*/lib/libomp.dylib"), reverse=True))
+
+    for lib_path in candidates:
+        if not Path(lib_path).exists():
+            continue
+        lib_dir = str(Path(lib_path).parent)
+        current = os.environ.get("DYLD_FALLBACK_LIBRARY_PATH", "")
+        paths = [p for p in current.split(":") if p]
+        if lib_dir not in paths:
+            os.environ["DYLD_FALLBACK_LIBRARY_PATH"] = ":".join([lib_dir] + paths)
+        try:
+            ctypes.CDLL(lib_path)
+            return
+        except OSError:
+            continue
+
+
+_prepare_openmp_runtime()
 
 
 def compute_shap_values(model, X: pd.DataFrame, model_name: str) -> np.ndarray:
