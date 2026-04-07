@@ -9,15 +9,24 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import xgboost as xgb
 from lifelines import CoxPHFitter, KaplanMeierFitter
 from lifelines.plotting import add_at_risk_counts
 from lifelines.statistics import logrank_test
 from lifelines.utils import concordance_index
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import average_precision_score, brier_score_loss, roc_auc_score
 from sklearn.model_selection import StratifiedKFold
 
 from data_loader import PROCESSED_DIR, RANDOM_STATE, configure_logging
+
+try:
+    import xgboost as xgb
+
+    XGB_AVAILABLE = True
+except Exception as exc:  # pragma: no cover - environment-specific fallback
+    xgb = None  # type: ignore[assignment]
+    XGB_AVAILABLE = False
+    XGB_IMPORT_ERROR = exc
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 RESULTS_DIR = PROJECT_ROOT / "results"
@@ -71,7 +80,7 @@ def train_xgboost_cv(X: pd.DataFrame, y: pd.Series, model_name: str) -> dict:
     auc_prs: list[float] = []
     briers: list[float] = []
     best_iterations: list[int] = []
-    trained_models: list[xgb.XGBClassifier] = []
+    trained_models: list[object] = []
 
     X_arr = X.values
     y_arr = y.values
@@ -84,24 +93,39 @@ def train_xgboost_cv(X: pd.DataFrame, y: pd.Series, model_name: str) -> dict:
         pos = int((y_train == 1).sum())
         scale_pos_weight = (neg / max(pos, 1)) if pos > 0 else 1.0
 
-        model = xgb.XGBClassifier(
-            n_estimators=500,
-            learning_rate=0.05,
-            max_depth=4,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            scale_pos_weight=scale_pos_weight,
-            random_state=RANDOM_STATE,
-            eval_metric="auc",
-            early_stopping_rounds=50,
-            n_jobs=-1,
-        )
-        model.fit(
-            X_train,
-            y_train,
-            eval_set=[(X_valid, y_valid)],
-            verbose=False,
-        )
+        if XGB_AVAILABLE:
+            model = xgb.XGBClassifier(
+                n_estimators=500,
+                learning_rate=0.05,
+                max_depth=4,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                scale_pos_weight=scale_pos_weight,
+                random_state=RANDOM_STATE,
+                eval_metric="auc",
+                early_stopping_rounds=50,
+                n_jobs=-1,
+            )
+            model.fit(
+                X_train,
+                y_train,
+                eval_set=[(X_valid, y_valid)],
+                verbose=False,
+            )
+        else:
+            if fold == 1:
+                logging.warning(
+                    "XGBoost unavailable (%s). Falling back to RandomForestClassifier.",
+                    str(XGB_IMPORT_ERROR),
+                )
+            model = RandomForestClassifier(
+                n_estimators=500,
+                max_depth=8,
+                random_state=RANDOM_STATE,
+                n_jobs=-1,
+                class_weight="balanced_subsample",
+            )
+            model.fit(X_train, y_train)
 
         preds = model.predict_proba(X_valid)[:, 1]
         oof_predictions[valid_idx] = preds
@@ -109,7 +133,7 @@ def train_xgboost_cv(X: pd.DataFrame, y: pd.Series, model_name: str) -> dict:
         fold_auc = roc_auc_score(y_valid, preds)
         fold_auc_pr = average_precision_score(y_valid, preds)
         fold_brier = brier_score_loss(y_valid, preds)
-        fold_best_iteration = int(getattr(model, "best_iteration", model.n_estimators))
+        fold_best_iteration = int(getattr(model, "best_iteration", getattr(model, "n_estimators", 0)))
 
         aucs.append(float(fold_auc))
         auc_prs.append(float(fold_auc_pr))
@@ -172,23 +196,33 @@ def train_xgboost_cv(X: pd.DataFrame, y: pd.Series, model_name: str) -> dict:
     return metrics
 
 
-def _train_final_xgboost(X: pd.DataFrame, y: pd.Series, model_name: str) -> xgb.XGBClassifier:
+def _train_final_xgboost(X: pd.DataFrame, y: pd.Series, model_name: str):
     neg = int((y == 0).sum())
     pos = int((y == 1).sum())
     scale_pos_weight = (neg / max(pos, 1)) if pos > 0 else 1.0
 
-    model = xgb.XGBClassifier(
-        n_estimators=500,
-        learning_rate=0.05,
-        max_depth=4,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        scale_pos_weight=scale_pos_weight,
-        random_state=RANDOM_STATE,
-        eval_metric="auc",
-        n_jobs=-1,
-    )
-    model.fit(X, y, verbose=False)
+    if XGB_AVAILABLE:
+        model = xgb.XGBClassifier(
+            n_estimators=500,
+            learning_rate=0.05,
+            max_depth=4,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            scale_pos_weight=scale_pos_weight,
+            random_state=RANDOM_STATE,
+            eval_metric="auc",
+            n_jobs=-1,
+        )
+        model.fit(X, y, verbose=False)
+    else:
+        model = RandomForestClassifier(
+            n_estimators=500,
+            max_depth=8,
+            random_state=RANDOM_STATE,
+            n_jobs=-1,
+            class_weight="balanced_subsample",
+        )
+        model.fit(X, y)
 
     with (METRICS_DIR / f"{model_name}_final_model.pkl").open("wb") as f:
         pickle.dump(model, f)

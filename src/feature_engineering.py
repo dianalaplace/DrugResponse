@@ -4,6 +4,7 @@ import logging
 from pathlib import Path
 
 import pandas as pd
+from pandas.api.types import is_object_dtype, is_string_dtype
 from sklearn.preprocessing import StandardScaler
 
 from data_loader import PROCESSED_DIR, configure_logging
@@ -82,7 +83,13 @@ def preprocess_features(X: pd.DataFrame) -> pd.DataFrame:
     Returns:
         Preprocessed feature matrix.
     """
-    categorical_cols = [c for c in X.columns if X[c].dtype == "object" or str(X[c].dtype).startswith("category")]
+    categorical_cols = [
+        c
+        for c in X.columns
+        if is_object_dtype(X[c].dtype)
+        or isinstance(X[c].dtype, pd.CategoricalDtype)
+        or is_string_dtype(X[c].dtype)
+    ]
     X_encoded = pd.get_dummies(X, columns=categorical_cols, drop_first=False)
 
     X_scaled = X_encoded.copy()

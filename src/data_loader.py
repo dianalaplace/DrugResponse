@@ -103,11 +103,18 @@ def _safe_numeric(series: pd.Series) -> pd.Series:
 def _encode_binary_status(value: object) -> float:
     if pd.isna(value):
         return np.nan
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return 1.0 if float(value) >= 0.5 else 0.0
     v = str(value).strip().lower()
-    if v in {"positive", "pos", "1", "yes", "true", "amplified", "overexpressed"}:
+    if v in {"positive", "pos", "1", "1.0", "yes", "true", "amplified", "overexpressed"}:
         return 1.0
-    if v in {"negative", "neg", "0", "no", "false", "not amplified", "normal"}:
+    if v in {"negative", "neg", "0", "0.0", "no", "false", "not amplified", "normal"}:
         return 0.0
+    try:
+        numeric_v = float(v)
+        return 1.0 if numeric_v >= 0.5 else 0.0
+    except ValueError:
+        pass
     return np.nan
 
 

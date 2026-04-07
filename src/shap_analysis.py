@@ -52,8 +52,24 @@ def compute_shap_values(model, X: pd.DataFrame, model_name: str) -> np.ndarray:
     SHAP_DIR.mkdir(parents=True, exist_ok=True)
 
     explainer = shap.TreeExplainer(model)
-    shap_values = explainer.shap_values(X)
-    shap_values = np.asarray(shap_values)
+    shap_values_raw = explainer.shap_values(X)
+    shap_values = np.asarray(shap_values_raw)
+
+    # Binary classifiers can return either:
+    # - (n_samples, n_features)
+    # - (n_samples, n_features, n_classes)
+    # - (n_classes, n_samples, n_features)
+    # Keep contributions for positive class to get 2D matrix.
+    if shap_values.ndim == 3:
+        if shap_values.shape[0] == len(X.index):
+            class_idx = 1 if shap_values.shape[2] > 1 else 0
+            shap_values = shap_values[:, :, class_idx]
+        else:
+            class_idx = 1 if shap_values.shape[0] > 1 else 0
+            shap_values = shap_values[class_idx]
+
+    if shap_values.ndim != 2:
+        raise ValueError(f"Unsupported SHAP shape after coercion: {shap_values.shape}")
 
     out_path = SHAP_DIR / f"{model_name}_shap_values.npy"
     np.save(out_path, shap_values)
