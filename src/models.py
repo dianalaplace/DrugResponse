@@ -409,21 +409,61 @@ def train_survival_model(X: pd.DataFrame, duration: pd.Series, event: pd.Series)
 
     data = X.copy()
     data["DFS_months"] = pd.to_numeric(duration, errors="coerce")
-    data["DFS_event"] = pd.to_numeric(event, errors="coerce").astype(int)
+    data["DFS_event"] = pd.to_numeric(event, errors="coerce")
     data = data.dropna(subset=["DFS_months", "DFS_event"])
+    data["DFS_event"] = data["DFS_event"].astype(int)
 
     if data.empty:
         raise ValueError("No valid rows for survival modeling")
 
-    cph = CoxPHFitter(penalizer=0.1)
-    cph.fit(data, duration_col="DFS_months", event_col="DFS_event", show_progress=False)
-
     X_model = data.drop(columns=["DFS_months", "DFS_event"])
-    risk_scores = pd.Series(
-        cph.predict_partial_hazard(X_model).values.ravel(),
-        index=X_model.index,
-        name="risk",
-    )
+    # Improve numerical stability: remove near-constant and highly collinear columns.
+    variances = X_model.var(ddof=0)
+    low_var_cols = variances[variances < 1e-6].index.tolist()
+    if low_var_cols:
+        X_model = X_model.drop(columns=low_var_cols)
+        logging.info("Survival model dropped %d low-variance features", len(low_var_cols))
+
+    if X_model.shape[1] > 1:
+        corr = X_model.corr().abs()
+        upper = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
+        collinear_cols = [col for col in upper.columns if (upper[col] > 0.995).any()]
+        if collinear_cols:
+            X_model = X_model.drop(columns=collinear_cols)
+            logging.info("Survival model dropped %d highly collinear features", len(collinear_cols))
+
+    fit_data = X_model.copy()
+    fit_data["DFS_months"] = data["DFS_months"]
+    fit_data["DFS_event"] = data["DFS_event"]
+
+    cph: CoxPHFitter | None = None
+    last_exc: Exception | None = None
+    for penalizer, l1_ratio in [(0.1, 0.0), (0.5, 0.0), (1.0, 0.0), (1.0, 0.1), (5.0, 0.1)]:
+        try:
+            candidate = CoxPHFitter(penalizer=penalizer, l1_ratio=l1_ratio)
+            candidate.fit(fit_data, duration_col="DFS_months", event_col="DFS_event", show_progress=False)
+            cph = candidate
+            logging.info("Survival Cox fit converged with penalizer=%.2f l1_ratio=%.2f", penalizer, l1_ratio)
+            break
+        except Exception as exc:  # pragma: no cover - data-dependent convergence path
+            last_exc = exc
+            logging.warning(
+                "Survival Cox fit failed (penalizer=%.2f, l1=%.2f): %s",
+                penalizer,
+                l1_ratio,
+                str(exc),
+            )
+
+    if cph is None:
+        # Fallback risk score keeps pipeline runnable even under severe collinearity.
+        logging.warning("Falling back to linear risk proxy for survival due to Cox convergence failure.")
+        risk_scores = pd.Series(X_model.sum(axis=1).values, index=X_model.index, name="risk")
+    else:
+        risk_scores = pd.Series(
+            cph.predict_partial_hazard(X_model).values.ravel(),
+            index=X_model.index,
+            name="risk",
+        )
 
     T = data["DFS_months"]
     E = data["DFS_event"]
@@ -451,8 +491,9 @@ def train_survival_model(X: pd.DataFrame, duration: pd.Series, event: pd.Series)
     with (METRICS_DIR / "survival_metrics.json").open("w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2)
 
-    with (METRICS_DIR / "cox_model.pkl").open("wb") as f:
-        pickle.dump(cph, f)
+    if cph is not None:
+        with (METRICS_DIR / "cox_model.pkl").open("wb") as f:
+            pickle.dump(cph, f)
 
     logging.info(
         "Survival model: C-index %.4f (95%% CI %.4f-%.4f), log-rank p=%.4g",

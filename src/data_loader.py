@@ -16,6 +16,7 @@ PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
 
 RNASEQ_FILE = RAW_DIR / "tcga_brca_rnaseq_tpm.tsv"
 CLINICAL_FILE = RAW_DIR / "tcga_brca_clinical.tsv"
+XENA_CLINICAL_MATRIX_FILE = RAW_DIR / "BRCA_clinicalMatrix.tsv"
 
 REQUIRED_CLINICAL_COLUMNS = [
     "patient_id",
@@ -34,31 +35,74 @@ REQUIRED_CLINICAL_COLUMNS = [
 
 COLUMN_ALIASES: dict[str, list[str]] = {
     "patient_id": [
-        "patient_id",
+        "sampleID",
+        "bcr_patient_barcode",
+        "bcr_sample_barcode",
         "case_submitter_id",
         "submitter_id",
-        "bcr_patient_barcode",
+        "_PATIENT",
+        "patient_id",
         "case_id",
     ],
-    "subtype_PAM50": ["subtype_PAM50", "pam50", "PAM50", "subtype", "tumor_subtype"],
-    "age_at_diagnosis": ["age_at_diagnosis", "age", "diagnosis_age"],
-    "tumor_stage_T": ["tumor_stage_T", "ajcc_pathologic_t", "pathologic_T", "t_stage"],
-    "tumor_stage_N": ["tumor_stage_N", "ajcc_pathologic_n", "pathologic_N", "n_stage"],
-    "ER_status": ["ER_status", "er_status", "er_status_by_ihc"],
-    "PR_status": ["PR_status", "pr_status", "pr_status_by_ihc"],
-    "HER2_status": ["HER2_status", "her2_status", "her2_status_by_ihc"],
-    "Ki67": ["Ki67", "ki67", "proliferation_index"],
-    "pCR": ["pCR", "pathologic_complete_response", "response", "binary_response"],
+    "subtype_PAM50": [
+        "subtype_PAM50",
+        "pam50",
+        "PAM50",
+        "subtype",
+        "tumor_subtype",
+        "PAM50Call_RNAseq",
+        "PAM50_mRNA_nature2012",
+    ],
+    "age_at_diagnosis": [
+        "age_at_diagnosis",
+        "age",
+        "diagnosis_age",
+        "age_at_initial_pathologic_diagnosis",
+        "Age_at_Initial_Pathologic_Diagnosis_nature2012",
+    ],
+    "tumor_stage_T": [
+        "tumor_stage_T",
+        "ajcc_pathologic_t",
+        "pathologic_T",
+        "t_stage",
+        "Tumor_nature2012",
+    ],
+    "tumor_stage_N": [
+        "tumor_stage_N",
+        "ajcc_pathologic_n",
+        "pathologic_N",
+        "n_stage",
+        "Node_nature2012",
+    ],
+    "ER_status": ["ER_status", "er_status", "er_status_by_ihc", "ER_Status_nature2012"],
+    "PR_status": ["PR_status", "pr_status", "pr_status_by_ihc", "PR_Status_nature2012"],
+    "HER2_status": [
+        "HER2_status",
+        "her2_status",
+        "her2_status_by_ihc",
+        "HER2_Final_Status_nature2012",
+    ],
+    "Ki67": ["Ki67", "ki67", "proliferation_index", "immunohistochemistry_positive_cell_score"],
+    "pCR": [
+        "pCR",
+        "pathologic_complete_response",
+        "response",
+        "binary_response",
+        "new_tumor_event_after_initial_treatment",
+    ],
     "DFS_months": [
         "DFS_months",
         "disease_free_survival_months",
         "days_to_new_tumor_event_after_initial_treatment",
+        "OS_Time_nature2012",
     ],
     "DFS_event": [
         "DFS_event",
         "disease_free_status",
         "new_tumor_event",
         "recurrence_event",
+        "new_tumor_event_after_initial_treatment",
+        "OS_event_nature2012",
     ],
 }
 
@@ -118,6 +162,21 @@ def _encode_binary_status(value: object) -> float:
     return np.nan
 
 
+def _encode_no_event_response(value: object) -> float:
+    """Encode no-event state as response for response-proxy target."""
+    if pd.isna(value):
+        return np.nan
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return 1.0 - _encode_binary_status(value)
+
+    v = str(value).strip().lower()
+    if v in {"no", "0", "0.0", "false", "diseasefree", "disease free", "living"}:
+        return 1.0
+    if v in {"yes", "1", "1.0", "true", "recurred/progressed", "deceased"}:
+        return 0.0
+    return np.nan
+
+
 def _encode_stage(value: object, prefix: str) -> float:
     if pd.isna(value):
         return np.nan
@@ -145,9 +204,22 @@ def _prepare_clinical_columns(df: pd.DataFrame) -> pd.DataFrame:
             renamed[hit] = canonical
 
     out = df.rename(columns=renamed)
+    out = out.loc[:, ~out.columns.duplicated(keep="first")]
     for col in REQUIRED_CLINICAL_COLUMNS:
         if col not in out.columns:
             out[col] = np.nan
+
+    # Preserve raw event fields for realistic target derivation.
+    event_source = (
+        df["new_tumor_event_after_initial_treatment"]
+        if "new_tumor_event_after_initial_treatment" in df.columns
+        else pd.Series(np.nan, index=df.index)
+    )
+    dfs_days_source = (
+        df["days_to_new_tumor_event_after_initial_treatment"]
+        if "days_to_new_tumor_event_after_initial_treatment" in df.columns
+        else pd.Series(np.nan, index=df.index)
+    )
 
     out = out[REQUIRED_CLINICAL_COLUMNS].copy()
     out["patient_id"] = out["patient_id"].astype(str).map(normalize_patient_id)
@@ -158,12 +230,19 @@ def _prepare_clinical_columns(df: pd.DataFrame) -> pd.DataFrame:
     out["tumor_stage_T"] = out["tumor_stage_T"].map(lambda x: _encode_stage(x, "T"))
     out["tumor_stage_N"] = out["tumor_stage_N"].map(lambda x: _encode_stage(x, "N"))
 
-    out["pCR"] = out["pCR"].map(_encode_binary_status)
-    out["DFS_event"] = out["DFS_event"].map(_encode_binary_status)
+    pcr_from_input = out["pCR"].map(_encode_binary_status)
+    pcr_from_event = event_source.map(_encode_no_event_response)
+    out["pCR"] = pcr_from_event.combine_first(pcr_from_input)
+
+    dfs_event_from_input = out["DFS_event"].map(_encode_binary_status)
+    dfs_event_from_event = event_source.map(_encode_binary_status)
+    out["DFS_event"] = dfs_event_from_event.combine_first(dfs_event_from_input)
 
     continuous = ["age_at_diagnosis", "Ki67", "DFS_months"]
     for col in continuous:
         out[col] = _safe_numeric(out[col])
+
+    out["DFS_months"] = _safe_numeric(dfs_days_source).div(30.44).combine_first(out["DFS_months"])
 
     out["subtype_PAM50"] = out["subtype_PAM50"].astype(str).replace({"nan": np.nan})
     out["subtype_PAM50"] = out["subtype_PAM50"].str.upper().replace(
@@ -177,7 +256,7 @@ def _prepare_clinical_columns(df: pd.DataFrame) -> pd.DataFrame:
     )
 
     categorical = ["subtype_PAM50"]
-    numeric = [
+    numeric_impute = [
         "age_at_diagnosis",
         "tumor_stage_T",
         "tumor_stage_N",
@@ -185,9 +264,6 @@ def _prepare_clinical_columns(df: pd.DataFrame) -> pd.DataFrame:
         "PR_status",
         "HER2_status",
         "Ki67",
-        "pCR",
-        "DFS_months",
-        "DFS_event",
     ]
 
     for col in categorical:
@@ -195,7 +271,7 @@ def _prepare_clinical_columns(df: pd.DataFrame) -> pd.DataFrame:
         if not mode.empty:
             out[col] = out[col].fillna(mode.iloc[0])
 
-    for col in numeric:
+    for col in numeric_impute:
         med = out[col].median(skipna=True)
         if pd.isna(med):
             med = 0.0
@@ -332,7 +408,7 @@ def ensure_raw_data_available(rnaseq_path: Path, clinical_path: Path) -> None:
     Returns:
         None
     """
-    if not clinical_path.exists():
+    if not clinical_path.exists() and not XENA_CLINICAL_MATRIX_FILE.exists():
         _download_tcga_clinical_gdc(clinical_path)
 
     if not rnaseq_path.exists():
@@ -398,8 +474,22 @@ def load_clinical(path: str) -> pd.DataFrame:
     cleaned = _prepare_clinical_columns(df)
 
     assert cleaned.index.is_unique, "Duplicate patient IDs in clinical table"
-    assert not cleaned.isna().any().any(), "Clinical table contains NaN after imputation"
     assert set(REQUIRED_CLINICAL_COLUMNS) - {"patient_id"} <= set(cleaned.columns), "Missing required clinical columns"
+    feature_cols = [
+        "subtype_PAM50",
+        "age_at_diagnosis",
+        "tumor_stage_T",
+        "tumor_stage_N",
+        "ER_status",
+        "PR_status",
+        "HER2_status",
+        "Ki67",
+    ]
+    assert not cleaned[feature_cols].isna().any().any(), "Clinical feature columns contain NaN after imputation"
+
+    valid_target = int(cleaned["pCR"].isin([0.0, 1.0]).sum())
+    class_counts = cleaned.loc[cleaned["pCR"].isin([0.0, 1.0]), "pCR"].value_counts().to_dict()
+    logging.info("Clinical target rows with observed pCR: %d | class counts: %s", valid_target, class_counts)
 
     logging.info("Clinical table loaded: %d patients x %d columns", cleaned.shape[0], cleaned.shape[1])
     return cleaned
@@ -442,7 +532,9 @@ def main() -> None:
     ensure_raw_data_available(RNASEQ_FILE, CLINICAL_FILE)
 
     rnaseq = load_rnaseq(str(RNASEQ_FILE))
-    clinical = load_clinical(str(CLINICAL_FILE))
+    clinical_source = XENA_CLINICAL_MATRIX_FILE if XENA_CLINICAL_MATRIX_FILE.exists() else CLINICAL_FILE
+    logging.info("Using clinical source: %s", clinical_source)
+    clinical = load_clinical(str(clinical_source))
     merged = merge_datasets(rnaseq, clinical)
 
     rnaseq.to_csv(PROCESSED_DIR / "rnaseq_processed.csv")

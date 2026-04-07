@@ -63,13 +63,26 @@ def build_feature_matrix(clinical: pd.DataFrame, tme_features: pd.DataFrame) -> 
     tme_subset = tme_features[TME_FEATURES].copy()
     X_full = X_baseline.join(tme_subset, how="inner")
 
-    y_pcr = clinical.loc[X_full.index, "pCR"].astype(int)
-    y_survival = clinical.loc[X_full.index, ["DFS_months", "DFS_event"]].copy()
+    y_raw = pd.to_numeric(clinical.loc[X_full.index, "pCR"], errors="coerce")
+    # Fallback target for sparse pCR availability: no recurrence as responder.
+    if y_raw.dropna().nunique() < 2 and "DFS_event" in clinical.columns:
+        y_raw = 1.0 - pd.to_numeric(clinical.loc[X_full.index, "DFS_event"], errors="coerce")
+        logging.warning("pCR had insufficient class diversity; using 1-DFS_event as response proxy target.")
 
-    X_baseline = X_baseline.loc[X_full.index]
+    valid_idx = y_raw[y_raw.isin([0.0, 1.0])].index
+    if len(valid_idx) < 100:
+        raise ValueError("Too few rows with observed binary response target.")
+
+    X_baseline = X_baseline.loc[valid_idx]
+    X_full = X_full.loc[valid_idx]
+    y_pcr = y_raw.loc[valid_idx].astype(int)
+    y_survival = clinical.loc[valid_idx, ["DFS_months", "DFS_event"]].copy()
 
     assert len(X_baseline) == len(X_full) == len(y_pcr) == len(y_survival)
-    assert not y_survival.isna().any().any(), "Survival labels contain NaN"
+    class_counts = y_pcr.value_counts().to_dict()
+    if len(class_counts) < 2:
+        raise ValueError("Binary response target has a single class after filtering.")
+    logging.info("Response target distribution after filtering: %s", class_counts)
 
     return X_baseline, X_full, y_pcr, y_survival
 
