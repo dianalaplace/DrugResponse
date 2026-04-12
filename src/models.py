@@ -7,20 +7,60 @@ import json
 import logging
 import os
 import pickle
+import warnings
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from lifelines import CoxPHFitter, KaplanMeierFitter
-from lifelines.plotting import add_at_risk_counts
-from lifelines.statistics import logrank_test
-from lifelines.utils import concordance_index
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import ExtraTreesClassifier
 from sklearn.metrics import average_precision_score, brier_score_loss, roc_auc_score
 from sklearn.model_selection import StratifiedKFold
 
 from data_loader import PROCESSED_DIR, RANDOM_STATE, configure_logging
+
+ABLATION_CONFIGS = {
+    "A_baseline": {
+        "data": "tcga_only",
+        "target": "proxy_dfs",
+        "tme": "none",
+        "description": "Clinical + genomic only, proxy pCR target",
+    },
+    "B_real_pcr": {
+        "data": "tcga_plus_geo",
+        "target": "real_pcr",
+        "tme": "none",
+        "description": "Clinical + genomic, real pCR from GEO",
+    },
+    "C_tme_lm22": {
+        "data": "tcga_plus_geo",
+        "target": "real_pcr",
+        "tme": "lm22",
+        "description": "Clinical + genomic + LM22 TME, real pCR",
+    },
+    "D_tme_scrna": {
+        "data": "tcga_plus_geo",
+        "target": "real_pcr",
+        "tme": "scrna",
+        "description": "Clinical + genomic + scRNA TME (BEST)",
+    },
+}
+
+try:
+    from lifelines import CoxPHFitter, KaplanMeierFitter
+    from lifelines.plotting import add_at_risk_counts
+    from lifelines.statistics import logrank_test
+    from lifelines.utils import concordance_index
+
+    LIFELINES_AVAILABLE = True
+except Exception as exc:  # pragma: no cover - environment-specific fallback
+    CoxPHFitter = None  # type: ignore[assignment]
+    KaplanMeierFitter = None  # type: ignore[assignment]
+    add_at_risk_counts = None  # type: ignore[assignment]
+    logrank_test = None  # type: ignore[assignment]
+    concordance_index = None  # type: ignore[assignment]
+    LIFELINES_AVAILABLE = False
+    LIFELINES_IMPORT_ERROR = exc
 
 
 def _prepare_openmp_runtime() -> None:
@@ -144,19 +184,24 @@ def train_xgboost_cv(X: pd.DataFrame, y: pd.Series, model_name: str) -> dict:
         else:
             if fold == 1:
                 logging.warning(
-                    "XGBoost unavailable (%s). Falling back to RandomForestClassifier.",
+                    "XGBoost unavailable (%s). Falling back to ExtraTreesClassifier.",
                     str(XGB_IMPORT_ERROR),
                 )
-            model = RandomForestClassifier(
-                n_estimators=500,
-                max_depth=8,
+            model = ExtraTreesClassifier(
+                n_estimators=800,
+                max_depth=None,
+                max_features="sqrt",
                 random_state=RANDOM_STATE,
                 n_jobs=-1,
                 class_weight="balanced_subsample",
             )
-            model.fit(X_train, y_train)
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", category=RuntimeWarning, module="sklearn")
+                model.fit(X_train, y_train)
 
-        preds = model.predict_proba(X_valid)[:, 1]
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=RuntimeWarning, module="sklearn")
+            preds = model.predict_proba(X_valid)[:, 1]
         oof_predictions[valid_idx] = preds
 
         fold_auc = roc_auc_score(y_valid, preds)
@@ -244,14 +289,17 @@ def _train_final_xgboost(X: pd.DataFrame, y: pd.Series, model_name: str):
         )
         model.fit(X, y, verbose=False)
     else:
-        model = RandomForestClassifier(
-            n_estimators=500,
-            max_depth=8,
+        model = ExtraTreesClassifier(
+            n_estimators=800,
+            max_depth=None,
+            max_features="sqrt",
             random_state=RANDOM_STATE,
             n_jobs=-1,
             class_weight="balanced_subsample",
         )
-        model.fit(X, y)
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=RuntimeWarning, module="sklearn")
+            model.fit(X, y)
 
     with (METRICS_DIR / f"{model_name}_final_model.pkl").open("wb") as f:
         pickle.dump(model, f)
@@ -321,6 +369,9 @@ def compare_models(baseline_metrics: dict, full_metrics: dict) -> None:
 
 
 def _bootstrap_c_index(duration: pd.Series, event: pd.Series, risk: pd.Series, n_boot: int = 1000) -> tuple[float, float]:
+    if not LIFELINES_AVAILABLE:
+        return float("nan"), float("nan")
+
     rng = np.random.default_rng(RANDOM_STATE)
     n = len(duration)
     ci_scores: list[float] = []
@@ -355,6 +406,9 @@ def plot_km_curves(T: pd.Series, E: pd.Series, risk_groups: pd.Series) -> None:
     Returns:
         None
     """
+    if not LIFELINES_AVAILABLE:
+        return
+
     SURVIVAL_DIR.mkdir(parents=True, exist_ok=True)
 
     plt.rcParams.update({"font.family": "serif", "axes.grid": False})
@@ -406,6 +460,20 @@ def train_survival_model(X: pd.DataFrame, duration: pd.Series, event: pd.Series)
     """
     SURVIVAL_DIR.mkdir(parents=True, exist_ok=True)
     METRICS_DIR.mkdir(parents=True, exist_ok=True)
+
+    if not LIFELINES_AVAILABLE:
+        logging.warning("lifelines is unavailable (%s); skipping survival model.", str(LIFELINES_IMPORT_ERROR))
+        metrics = {
+            "c_index": float("nan"),
+            "ci_lower": float("nan"),
+            "ci_upper": float("nan"),
+            "logrank_p": float("nan"),
+            "skipped": True,
+            "reason": str(LIFELINES_IMPORT_ERROR),
+        }
+        with (METRICS_DIR / "survival_metrics.json").open("w", encoding="utf-8") as f:
+            json.dump(metrics, f, indent=2)
+        return metrics
 
     data = X.copy()
     data["DFS_months"] = pd.to_numeric(duration, errors="coerce")
@@ -505,23 +573,234 @@ def train_survival_model(X: pd.DataFrame, duration: pd.Series, event: pd.Series)
     return metrics
 
 
-def _load_features() -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.DataFrame]:
+def _load_ablation_variant(config_key: str) -> tuple[pd.DataFrame, pd.Series] | None:
+    """Load features and labels for a single ablation variant.
+
+    Args:
+        config_key: Key from ABLATION_CONFIGS (e.g. 'A_baseline').
+
+    Returns:
+        Tuple of (X, y) or None if data unavailable.
+    """
+    config = ABLATION_CONFIGS[config_key]
+
+    # Determine target labels
+    if config["target"] == "real_pcr":
+        geo_labels_path = PROCESSED_DIR / "geo_pcr_labels.csv"
+        if geo_labels_path.exists():
+            y_geo = pd.read_csv(geo_labels_path, index_col=0).iloc[:, 0].astype(int)
+        else:
+            y_geo = pd.Series(dtype=int)
+    else:
+        y_geo = pd.Series(dtype=int)
+
+    # TCGA labels (always available)
+    y_tcga_path = PROCESSED_DIR / "y_pcr.csv"
+    if not y_tcga_path.exists():
+        logging.warning("TCGA pCR labels not found for ablation variant %s", config_key)
+        return None
+    y_tcga = pd.read_csv(y_tcga_path, index_col=0).iloc[:, 0].astype(int)
+
+    # Determine features
+    X_baseline_path = PROCESSED_DIR / "X_baseline.csv"
+    if not X_baseline_path.exists():
+        logging.warning("Baseline features not found for ablation variant %s", config_key)
+        return None
+    X_baseline = pd.read_csv(X_baseline_path, index_col=0)
+
+    if config["tme"] == "lm22":
+        tme_path = PROCESSED_DIR / "tme_features.csv"
+        if tme_path.exists():
+            tme = pd.read_csv(tme_path, index_col=0)
+            common = X_baseline.index.intersection(tme.index)
+            X = X_baseline.loc[common].join(tme.loc[common])
+        else:
+            logging.warning("LM22 TME features not found; falling back to baseline for %s", config_key)
+            X = X_baseline.copy()
+    elif config["tme"] == "scrna":
+        scrna_path = PROCESSED_DIR / "scrna_tme_features.csv"
+        if scrna_path.exists():
+            scrna = pd.read_csv(scrna_path, index_col=0)
+            common = X_baseline.index.intersection(scrna.index)
+            X = X_baseline.loc[common].join(scrna.loc[common])
+        else:
+            logging.warning("scRNA TME features not found; falling back to baseline for %s", config_key)
+            X = X_baseline.copy()
+    else:
+        X = X_baseline.copy()
+
+    # Select target
+    if config["data"] == "tcga_plus_geo" and len(y_geo) > 0:
+        # Combine TCGA and GEO labels for shared samples where possible
+        y = pd.concat([y_tcga, y_geo])
+        y = y[~y.index.duplicated(keep="first")]
+    else:
+        y = y_tcga
+
+    # Align X and y
+    common = X.index.intersection(y.index)
+    if len(common) < 20:
+        logging.warning("Only %d samples for ablation variant %s", len(common), config_key)
+        return None
+
+    X = X.loc[common]
+    y = y.loc[common]
+
+    # Ensure binary target with both classes
+    if y.nunique() < 2:
+        logging.warning("Single-class target for ablation variant %s", config_key)
+        return None
+
+    # Handle NaN
+    X = X.fillna(0.0)
+
+    return X, y
+
+
+def run_ablation_study() -> dict:
+    """Train and evaluate all 4 ablation model variants.
+
+    Each variant uses 5-fold stratified CV with XGBoost.
+    Reports AUC-ROC, AUC-PR, Brier for each, and computes
+    deltas vs baseline at each step.
+
+    Returns:
+        Dict with all ablation metrics.
+    """
+    METRICS_DIR.mkdir(parents=True, exist_ok=True)
+
+    all_results: dict[str, dict] = {}
+    baseline_auc: float | None = None
+
+    logging.info("=" * 60)
+    logging.info("ABLATION STUDY — 4 Model Variants")
+    logging.info("=" * 60)
+
+    for config_key, config in ABLATION_CONFIGS.items():
+        logging.info("\n--- Variant %s: %s ---", config_key, config["description"])
+
+        data = _load_ablation_variant(config_key)
+        if data is None:
+            logging.warning("Skipping variant %s: data unavailable", config_key)
+            all_results[config_key] = {
+                "description": config["description"],
+                "status": "skipped",
+                "reason": "data_unavailable",
+            }
+            continue
+
+        X, y = data
+        try:
+            metrics = train_xgboost_cv(X, y, model_name=f"ablation_{config_key}")
+            auc = float(metrics["mean_auc"])
+            auc_pr = float(metrics["mean_auc_pr"])
+            brier = float(metrics["mean_brier"])
+
+            delta = float(auc - baseline_auc) if baseline_auc is not None else 0.0
+            if baseline_auc is None:
+                baseline_auc = auc
+
+            result = {
+                "description": config["description"],
+                "status": "ok",
+                "n_samples": int(len(y)),
+                "n_features": int(X.shape[1]),
+                "mean_auc": auc,
+                "std_auc": float(metrics["std_auc"]),
+                "mean_auc_pr": auc_pr,
+                "std_auc_pr": float(metrics["std_auc_pr"]),
+                "mean_brier": brier,
+                "std_brier": float(metrics["std_brier"]),
+                "delta_auc_vs_baseline": delta,
+            }
+            all_results[config_key] = result
+
+            logging.info(
+                "Variant %s: AUC=%.4f (delta=%+.4f), AUC-PR=%.4f, Brier=%.4f, N=%d, F=%d",
+                config_key, auc, delta, auc_pr, brier, len(y), X.shape[1],
+            )
+
+        except Exception as exc:
+            logging.error("Ablation variant %s failed: %s", config_key, exc)
+            all_results[config_key] = {
+                "description": config["description"],
+                "status": "error",
+                "reason": str(exc),
+            }
+
+    # Print formatted comparison table
+    logging.info("\n" + "=" * 80)
+    logging.info("ABLATION STUDY RESULTS")
+    logging.info("=" * 80)
+    logging.info("| %-12s | %-40s | %7s | %7s | %7s | %7s |",
+                  "Variant", "Description", "AUC", "±std", "Delta", "N")
+    logging.info("|" + "-" * 14 + "|" + "-" * 42 + "|" + "-" * 9 + "|" + "-" * 9 + "|" + "-" * 9 + "|" + "-" * 9 + "|")
+    for key, res in all_results.items():
+        if res.get("status") == "ok":
+            logging.info(
+                "| %-12s | %-40s | %7.4f | %7.4f | %+7.4f | %7d |",
+                key, res["description"][:40],
+                res["mean_auc"], res["std_auc"],
+                res["delta_auc_vs_baseline"], res["n_samples"],
+            )
+        else:
+            logging.info("| %-12s | %-40s | %7s | %7s | %7s | %7s |",
+                          key, res["description"][:40], "N/A", "N/A", "N/A", "N/A")
+
+    # Critical checks
+    logging.info("\n--- Critical Checks ---")
+    a = all_results.get("A_baseline", {})
+    b = all_results.get("B_real_pcr", {})
+    c = all_results.get("C_tme_lm22", {})
+    d = all_results.get("D_tme_scrna", {})
+
+    if b.get("status") == "ok" and a.get("status") == "ok":
+        ba_delta = b["mean_auc"] - a["mean_auc"]
+        logging.info("B vs A (real pCR vs proxy): delta=%+.4f %s",
+                      ba_delta, "PASS" if ba_delta > 0 else "FAIL")
+    if c.get("status") == "ok" and b.get("status") == "ok":
+        cb_delta = c["mean_auc"] - b["mean_auc"]
+        logging.info("C vs B (LM22 TME added): delta=%+.4f %s",
+                      cb_delta, "PASS" if cb_delta > 0 else "FAIL")
+    if d.get("status") == "ok" and c.get("status") == "ok":
+        dc_delta = d["mean_auc"] - c["mean_auc"]
+        logging.info("D vs C (scRNA vs LM22): delta=%+.4f %s",
+                      dc_delta, "PASS" if dc_delta > 0 else "FAIL")
+
+    # Save results
+    with (METRICS_DIR / "ablation_study.json").open("w", encoding="utf-8") as f:
+        json.dump(all_results, f, indent=2)
+    logging.info("Ablation results saved to %s", METRICS_DIR / "ablation_study.json")
+
+    return all_results
+
+
+def _load_features() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame | None, pd.Series, pd.DataFrame]:
     X_baseline = pd.read_csv(PROCESSED_DIR / "X_baseline.csv", index_col=0)
     X_full = pd.read_csv(PROCESSED_DIR / "X_full.csv", index_col=0)
+    X_tme_path = PROCESSED_DIR / "X_tme.csv"
+    X_tme = pd.read_csv(X_tme_path, index_col=0) if X_tme_path.exists() else None
     y_pcr = pd.read_csv(PROCESSED_DIR / "y_pcr.csv", index_col=0).iloc[:, 0].astype(int)
     y_survival = pd.read_csv(PROCESSED_DIR / "y_survival.csv", index_col=0)
 
     common = X_baseline.index.intersection(X_full.index).intersection(y_pcr.index).intersection(y_survival.index)
+    if X_tme is not None:
+        common = common.intersection(X_tme.index)
+
     X_baseline = X_baseline.loc[common]
     X_full = X_full.loc[common]
+    if X_tme is not None:
+        X_tme = X_tme.loc[common]
     y_pcr = y_pcr.loc[common]
     y_survival = y_survival.loc[common]
 
     assert not X_baseline.isna().any().any()
     assert not X_full.isna().any().any()
+    if X_tme is not None:
+        assert not X_tme.isna().any().any()
     assert set(y_pcr.unique()) <= {0, 1}
 
-    return X_baseline, X_full, y_pcr, y_survival
+    return X_baseline, X_full, X_tme, y_pcr, y_survival
 
 
 def main() -> None:
@@ -536,13 +815,22 @@ def main() -> None:
     configure_logging()
 
     parser = argparse.ArgumentParser(description="Train DrugResponce models")
-    parser.add_argument("--mode", choices=["baseline", "full", "all"], default="all")
+    parser.add_argument("--mode", choices=["baseline", "full", "tme", "all"], default="all")
+    parser.add_argument("--ablation", action="store_true", help="Run full ablation study (4 variants)")
     args = parser.parse_args()
 
-    X_baseline, X_full, y_pcr, y_survival = _load_features()
+    if args.ablation:
+        run_ablation_study()
+        if args.mode == "all":
+            logging.info("Ablation complete; continuing with standard model training...")
+        else:
+            return
+
+    X_baseline, X_full, X_tme, y_pcr, y_survival = _load_features()
 
     baseline_metrics: dict | None = None
     full_metrics: dict | None = None
+    tme_metrics: dict | None = None
 
     if args.mode in {"baseline", "all"}:
         baseline_metrics = train_xgboost_cv(X_baseline, y_pcr, model_name="baseline")
@@ -551,6 +839,22 @@ def main() -> None:
     if args.mode in {"full", "all"}:
         full_metrics = train_xgboost_cv(X_full, y_pcr, model_name="full")
         _train_final_xgboost(X_full, y_pcr, model_name="full")
+
+    if args.mode in {"tme", "all"}:
+        if X_tme is None or X_tme.empty:
+            raise FileNotFoundError(
+                f"TME-only mode requires {PROCESSED_DIR / 'X_tme.csv'}. Run tme_deconvolution.py and "
+                "feature_engineering.py --use-tme first."
+            )
+        tme_metrics = train_xgboost_cv(X_tme, y_pcr, model_name="tme")
+        _train_final_xgboost(X_tme, y_pcr, model_name="tme")
+
+    if args.mode == "full":
+        train_survival_model(X_full, y_survival["DFS_months"], y_survival["DFS_event"])
+    elif args.mode == "tme":
+        assert X_tme is not None
+        train_survival_model(X_tme, y_survival["DFS_months"], y_survival["DFS_event"])
+    elif args.mode == "all":
         train_survival_model(X_full, y_survival["DFS_months"], y_survival["DFS_event"])
 
     if args.mode == "all" and baseline_metrics is not None and full_metrics is not None:
@@ -561,6 +865,18 @@ def main() -> None:
             with baseline_path.open("r", encoding="utf-8") as f:
                 baseline_from_disk = json.load(f)
             compare_models(baseline_from_disk, full_metrics)
+    elif args.mode == "tme" and tme_metrics is not None:
+        baseline_path = METRICS_DIR / "baseline_cv_metrics.json"
+        if baseline_path.exists():
+            with baseline_path.open("r", encoding="utf-8") as f:
+                baseline_from_disk = json.load(f)
+            delta = float(tme_metrics["mean_auc"] - float(baseline_from_disk.get("mean_auc", np.nan)))
+            logging.info(
+                "TME-only vs baseline AUC delta: %+0.4f (TME=%.4f, baseline=%.4f)",
+                delta,
+                tme_metrics["mean_auc"],
+                float(baseline_from_disk.get("mean_auc", np.nan)),
+            )
 
 
 if __name__ == "__main__":

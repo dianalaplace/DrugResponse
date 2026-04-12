@@ -26,6 +26,12 @@ pip install -r requirements.txt
 ./run_pipeline.sh
 ```
 
+TME-only run:
+
+```bash
+./run_tme_pipeline.sh
+```
+
 ## Outputs
 
 - `results/metrics/*.json`

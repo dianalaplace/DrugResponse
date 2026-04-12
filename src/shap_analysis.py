@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import argparse
 import ctypes
 import glob
 import json
 import logging
 import os
 import pickle
+import warnings
 from pathlib import Path
 
 import matplotlib
@@ -67,21 +69,7 @@ def _prepare_openmp_runtime() -> None:
 _prepare_openmp_runtime()
 
 
-def compute_shap_values(model, X: pd.DataFrame, model_name: str) -> np.ndarray:
-    """Compute SHAP values for an XGBoost model.
-
-    Args:
-        model: Trained model.
-        X: Feature matrix.
-        model_name: Name for output filenames.
-
-    Returns:
-        SHAP values array.
-    """
-    SHAP_DIR.mkdir(parents=True, exist_ok=True)
-
-    explainer = shap.TreeExplainer(model)
-    shap_values_raw = explainer.shap_values(X)
+def _coerce_binary_shap(shap_values_raw, n_samples: int) -> np.ndarray:
     shap_values = np.asarray(shap_values_raw)
 
     # Binary classifiers can return either:
@@ -90,7 +78,7 @@ def compute_shap_values(model, X: pd.DataFrame, model_name: str) -> np.ndarray:
     # - (n_classes, n_samples, n_features)
     # Keep contributions for positive class to get 2D matrix.
     if shap_values.ndim == 3:
-        if shap_values.shape[0] == len(X.index):
+        if shap_values.shape[0] == n_samples:
             class_idx = 1 if shap_values.shape[2] > 1 else 0
             shap_values = shap_values[:, :, class_idx]
         else:
@@ -99,6 +87,29 @@ def compute_shap_values(model, X: pd.DataFrame, model_name: str) -> np.ndarray:
 
     if shap_values.ndim != 2:
         raise ValueError(f"Unsupported SHAP shape after coercion: {shap_values.shape}")
+    return np.asarray(shap_values, dtype=float)
+
+
+def compute_shap_values(model, X: pd.DataFrame, model_name: str) -> tuple[np.ndarray, object]:
+    """Compute SHAP values for a trained classifier.
+
+    Args:
+        model: Trained model.
+        X: Feature matrix.
+        model_name: Name for output filenames.
+
+    Returns:
+        Tuple of SHAP values array and explainer instance.
+    """
+    SHAP_DIR.mkdir(parents=True, exist_ok=True)
+    model_name_cls = model.__class__.__name__
+
+    if model_name_cls == "LogisticRegression":
+        explainer = shap.LinearExplainer(model, X)
+        shap_values = _coerce_binary_shap(explainer.shap_values(X), n_samples=len(X))
+    else:
+        explainer = shap.TreeExplainer(model)
+        shap_values = _coerce_binary_shap(explainer.shap_values(X), n_samples=len(X))
 
     out_path = SHAP_DIR / f"{model_name}_shap_values.npy"
     np.save(out_path, shap_values)
@@ -107,7 +118,7 @@ def compute_shap_values(model, X: pd.DataFrame, model_name: str) -> np.ndarray:
     with (SHAP_DIR / f"{model_name}_expected_value.json").open("w", encoding="utf-8") as f:
         json.dump({"expected_value": float(np.ravel(explainer.expected_value)[0])}, f)
 
-    return shap_values
+    return shap_values, explainer
 
 
 def plot_global_importance(shap_values: np.ndarray, X: pd.DataFrame) -> None:
@@ -152,8 +163,9 @@ def plot_beeswarm(shap_values: np.ndarray, X: pd.DataFrame) -> None:
     Returns:
         None
     """
+    X_plot = X.apply(pd.to_numeric, errors="coerce")
     plt.figure(figsize=(10, 6))
-    shap.summary_plot(shap_values, X, max_display=20, show=False)
+    shap.summary_plot(np.asarray(shap_values, dtype=float), X_plot, max_display=20, show=False)
     plt.tight_layout()
     plt.savefig(SHAP_DIR / "beeswarm.png", dpi=300)
     plt.close()
@@ -238,7 +250,7 @@ def _select_patient_indices(prob: np.ndarray) -> list[int]:
 
 
 def main() -> None:
-    """Run SHAP analyses for the full model.
+    """Run SHAP analyses for a selected model.
 
     Args:
         None
@@ -249,26 +261,46 @@ def main() -> None:
     configure_logging()
     SHAP_DIR.mkdir(parents=True, exist_ok=True)
 
-    X = pd.read_csv(PROCESSED_DIR / "X_full.csv", index_col=0)
+    parser = argparse.ArgumentParser(description="Run SHAP analyses")
+    parser.add_argument("--model", choices=["baseline", "full", "tme"], default="baseline")
+    args = parser.parse_args()
+    model_name = args.model
 
-    model_path = METRICS_DIR / "full_final_model.pkl"
+    x_map = {
+        "baseline": PROCESSED_DIR / "X_baseline.csv",
+        "full": PROCESSED_DIR / "X_full.csv",
+        "tme": PROCESSED_DIR / "X_tme.csv",
+    }
+    x_path = x_map[model_name]
+    if not x_path.exists():
+        raise FileNotFoundError(f"Missing feature matrix for SHAP: {x_path}")
+    X = pd.read_csv(x_path, index_col=0)
+
+    model_path = METRICS_DIR / f"{model_name}_final_model.pkl"
     if not model_path.exists():
         raise FileNotFoundError(f"Missing trained model for SHAP: {model_path}")
 
     with model_path.open("rb") as f:
         model = pickle.load(f)
 
-    shap_values = compute_shap_values(model, X, model_name="full")
-    explainer = shap.TreeExplainer(model)
+    shap_values, explainer = compute_shap_values(model, X, model_name=model_name)
 
-    probs = model.predict_proba(X)[:, 1]
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=RuntimeWarning, module="sklearn")
+        probs = model.predict_proba(X)[:, 1]
     setattr(explainer, "_drugresponce_proba", probs)
 
     plot_global_importance(shap_values, X)
     plot_beeswarm(shap_values, X)
     patient_indices = _select_patient_indices(probs)
     plot_patient_waterfall(shap_values, X, explainer, patient_indices)
-    tme_importance_report(shap_values, X)
+    if any(col in TME_FEATURES for col in X.columns):
+        tme_importance_report(shap_values, X)
+    else:
+        (SHAP_DIR / "tme_importance_report.txt").write_text(
+            "TME disabled in current run; no TME features were used in the model.\n",
+            encoding="utf-8",
+        )
 
     logging.info("Saved SHAP outputs to %s", SHAP_DIR)
 

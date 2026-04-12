@@ -9,8 +9,6 @@ import os
 import pickle
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
-
 import numpy as np
 import pandas as pd
 
@@ -20,6 +18,22 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 RESULTS_DIR = PROJECT_ROOT / "results"
 METRICS_DIR = RESULTS_DIR / "metrics"
 RECOMMEND_DIR = RESULTS_DIR / "recommendations"
+TME_COLUMNS = [
+    "M2_macrophage",
+    "CD8_T_cell",
+    "MDSC_proxy",
+    "CAF_proxy",
+    "NK_cell",
+    "B_cell",
+    "Treg",
+    "Dendritic",
+    "TGFb_activity",
+    "CXCL1_MDSC_axis",
+    "hypoxia_score",
+    "IL6_STAT3_axis",
+    "immune_exclusion",
+    "M2_polarization",
+]
 
 
 @dataclass
@@ -96,23 +110,15 @@ def _combine_probability(base_prob: float, drug_score: float, eligible: bool) ->
     return _clip_prob(p)
 
 
-def _build_drug_scores(
+def _build_drug_scores_baseline(
     patient_id: str,
     base_prob: float,
     clinical: pd.DataFrame,
-    tme: pd.DataFrame,
     expr: pd.DataFrame,
 ) -> list[DrugRecommendation]:
     er = float(clinical.at[patient_id, "ER_status"])
     pr = float(clinical.at[patient_id, "PR_status"])
     her2 = float(clinical.at[patient_id, "HER2_status"])
-
-    tme_row = tme.loc[patient_id]
-    m2 = float(tme_row.get("M2_macrophage", 0.0))
-    cd8 = float(tme_row.get("CD8_T_cell", 0.0))
-    nk = float(tme_row.get("NK_cell", 0.0))
-    exclusion = float(tme_row.get("immune_exclusion", 0.0))
-    hypoxia = float(tme_row.get("hypoxia_score", 0.0))
 
     ki67 = float(clinical.at[patient_id, "Ki67"])
     ki67_z = _zscore_value(ki67, clinical["Ki67"])
@@ -120,32 +126,32 @@ def _build_drug_scores(
     erbb2_z, erbb2_cov = _gene_z(expr, patient_id, ["ERBB2"])
     pi3k_z, pi3k_cov = _gene_z(expr, patient_id, ["PIK3CA", "AKT1", "MTOR"])
     cdk_z, cdk_cov = _gene_z(expr, patient_id, ["CCND1", "CDK4", "CDK6", "E2F1"])
-    ifng_z, ifng_cov = _gene_z(expr, patient_id, ["IFNG", "CXCL9", "CXCL10"])
     parp_z, parp_cov = _gene_z(expr, patient_id, ["PARP1", "PARP2", "BRCA1", "BRCA2", "RAD51"])
+    top2a_z, top2a_cov = _gene_z(expr, patient_id, ["TOP2A", "MKI67", "AURKA"])
 
     recs: list[DrugRecommendation] = []
 
     # 1) HER2-targeted
     elig = her2 >= 0.5
-    drug_score = _sigmoid(1.4 * (1.0 if elig else -1.0) + 1.2 * erbb2_z - 0.4 * m2 + 0.3 * cd8)
+    drug_score = _sigmoid(1.4 * (1.0 if elig else -1.0) + 1.2 * erbb2_z + 0.2 * ki67_z)
     prob = _combine_probability(base_prob, drug_score, elig)
     conf = _confidence_label(0.45 * erbb2_cov + 0.35 * abs(prob - 0.5) * 2 + 0.20 * (1.0 if elig else 0.4))
     reasons = [
         f"HER2 status: {'positive' if elig else 'negative'}",
         f"ERBB2 expression z-score: {erbb2_z:+.2f}",
-        f"TME context CD8={cd8:+.2f}, M2={m2:+.2f}",
+        f"Proliferation z-score: {ki67_z:+.2f}",
     ]
     recs.append(DrugRecommendation("Trastuzumab", "HER2 inhibitor", prob, conf, reasons))
 
     # 2) PI3K-targeted
     elig = (er >= 0.5) and (her2 < 0.5)
-    drug_score = _sigmoid(1.0 * pi3k_z + 0.8 * (1.0 if er >= 0.5 else -1.0) - 0.5 * exclusion)
+    drug_score = _sigmoid(1.0 * pi3k_z + 0.8 * (1.0 if er >= 0.5 else -1.0) + 0.2 * ki67_z)
     prob = _combine_probability(base_prob, drug_score, elig)
     conf = _confidence_label(0.45 * pi3k_cov + 0.35 * abs(prob - 0.5) * 2 + 0.20 * (1.0 if elig else 0.5))
     reasons = [
         f"Hormone/HER2 context: ER={int(er)}, HER2={int(her2)}",
         f"PI3K pathway score z: {pi3k_z:+.2f}",
-        f"Immune exclusion signature: {exclusion:+.2f}",
+        f"Proliferation z-score: {ki67_z:+.2f}",
     ]
     recs.append(DrugRecommendation("Alpelisib", "PI3K inhibitor", prob, conf, reasons))
 
@@ -161,39 +167,38 @@ def _build_drug_scores(
     ]
     recs.append(DrugRecommendation("Palbociclib", "CDK4/6 inhibitor", prob, conf, reasons))
 
-    # 4) Immunotherapy proxy
-    triple_negative = (er < 0.5) and (pr < 0.5) and (her2 < 0.5)
-    immune_signal = 0.8 * cd8 + 0.5 * nk + 0.6 * ifng_z - 0.8 * exclusion - 0.6 * m2
-    drug_score = _sigmoid(immune_signal)
-    prob = _combine_probability(base_prob, drug_score, triple_negative)
-    conf = _confidence_label(0.45 * ifng_cov + 0.35 * abs(prob - 0.5) * 2 + 0.20 * (1.0 if triple_negative else 0.4))
-    reasons = [
-        f"TNBC eligibility: {'met' if triple_negative else 'not met'}",
-        f"Immune activity score: {immune_signal:+.2f}",
-        f"CD8={cd8:+.2f}, NK={nk:+.2f}, exclusion={exclusion:+.2f}",
-    ]
-    recs.append(DrugRecommendation("Pembrolizumab", "PD-1 inhibitor", prob, conf, reasons))
-
-    # 5) PARP inhibitor proxy
+    # 4) PARP inhibitor proxy
     elig = parp_z > 0.0
-    drug_score = _sigmoid(0.9 * parp_z - 0.2 * exclusion + 0.2 * hypoxia)
+    drug_score = _sigmoid(0.9 * parp_z + 0.2 * ki67_z)
     prob = _combine_probability(base_prob, drug_score, elig)
     conf = _confidence_label(0.45 * parp_cov + 0.35 * abs(prob - 0.5) * 2 + 0.20 * (1.0 if elig else 0.5))
     reasons = [
         f"PARP/HRD proxy score z: {parp_z:+.2f}",
-        f"Hypoxia signature: {hypoxia:+.2f}",
-        f"Immune exclusion: {exclusion:+.2f}",
+        f"Proliferation z-score: {ki67_z:+.2f}",
+        f"Eligibility signal: {'high' if elig else 'moderate'}",
     ]
     recs.append(DrugRecommendation("Olaparib", "PARP inhibitor", prob, conf, reasons))
 
+    # 5) ADC/anti-proliferative targeted option
+    elig = top2a_z > 0.0
+    drug_score = _sigmoid(0.8 * top2a_z + 0.4 * ki67_z)
+    prob = _combine_probability(base_prob, drug_score, elig)
+    conf = _confidence_label(0.45 * top2a_cov + 0.35 * abs(prob - 0.5) * 2 + 0.20 * (1.0 if elig else 0.5))
+    reasons = [
+        f"TOP2A/proliferation score z: {top2a_z:+.2f}",
+        f"Ki67 z-score: {ki67_z:+.2f}",
+        f"Eligibility signal: {'high' if elig else 'moderate'}",
+    ]
+    recs.append(DrugRecommendation("Trastuzumab Deruxtecan", "HER2-directed ADC", prob, conf, reasons))
+
     # 6) Chemotherapy baseline option
     elig = True
-    drug_score = _sigmoid(0.5 * ki67_z + 0.3 * hypoxia - 0.3 * er)
+    drug_score = _sigmoid(0.5 * ki67_z - 0.3 * er + 0.2 * top2a_z)
     prob = _combine_probability(base_prob, drug_score, elig)
     conf = _confidence_label(0.55 + 0.35 * abs(prob - 0.5) * 2)
     reasons = [
         f"Proliferation (Ki67 z): {ki67_z:+.2f}",
-        f"Hypoxia signature: {hypoxia:+.2f}",
+        f"TOP2A score z: {top2a_z:+.2f}",
         "General cytotoxic fallback option",
     ]
     recs.append(DrugRecommendation("Paclitaxel", "Chemotherapy", prob, conf, reasons))
@@ -201,10 +206,123 @@ def _build_drug_scores(
     return sorted(recs, key=lambda r: r.probability, reverse=True)
 
 
-def _render_markdown(patient_id: str, base_prob: float, recs: list[DrugRecommendation], top_k: int = 3) -> str:
+def _tme_z(tme: pd.DataFrame, patient_id: str, col: str) -> float:
+    if col not in tme.columns:
+        return 0.0
+    return _zscore_value(float(tme.at[patient_id, col]), tme[col])
+
+
+def _build_drug_scores_tme(
+    patient_id: str,
+    base_prob: float,
+    tme: pd.DataFrame,
+) -> list[DrugRecommendation]:
+    cd8 = _tme_z(tme, patient_id, "CD8_T_cell")
+    nk = _tme_z(tme, patient_id, "NK_cell")
+    dendritic = _tme_z(tme, patient_id, "Dendritic")
+    m2 = _tme_z(tme, patient_id, "M2_macrophage")
+    mdsc = _tme_z(tme, patient_id, "MDSC_proxy")
+    caf = _tme_z(tme, patient_id, "CAF_proxy")
+    tgfb = _tme_z(tme, patient_id, "TGFb_activity")
+    cxcl1 = _tme_z(tme, patient_id, "CXCL1_MDSC_axis")
+    hypoxia = _tme_z(tme, patient_id, "hypoxia_score")
+    il6 = _tme_z(tme, patient_id, "IL6_STAT3_axis")
+    excl = _tme_z(tme, patient_id, "immune_exclusion")
+    m2_pol = _tme_z(tme, patient_id, "M2_polarization")
+
+    inflamed = 0.45 * cd8 + 0.30 * nk + 0.25 * dendritic - 0.35 * excl - 0.25 * tgfb
+    myeloid_suppression = 0.45 * m2 + 0.35 * mdsc + 0.20 * m2_pol
+    stromal_barrier = 0.50 * tgfb + 0.30 * caf + 0.20 * excl
+    angiogenic_stress = 0.60 * hypoxia + 0.40 * il6
+
+    recs: list[DrugRecommendation] = []
+
+    # 1) PD-1 inhibitor
+    elig = inflamed > -0.2
+    score = _sigmoid(1.2 * inflamed - 0.8 * stromal_barrier - 0.7 * myeloid_suppression)
+    prob = _combine_probability(base_prob, score, elig)
+    conf = _confidence_label(0.55 + 0.35 * abs(prob - 0.5) * 2)
+    reasons = [
+        f"Inflamed-TME index: {inflamed:+.2f}",
+        f"Suppression index (M2/MDSC): {myeloid_suppression:+.2f}",
+        f"Immune exclusion z-score: {excl:+.2f}",
+    ]
+    recs.append(DrugRecommendation("Pembrolizumab", "PD-1 inhibitor", prob, conf, reasons))
+
+    # 2) CSF1R inhibitor (macrophage reprogramming)
+    elig = myeloid_suppression > 0.0
+    score = _sigmoid(1.3 * myeloid_suppression + 0.3 * stromal_barrier)
+    prob = _combine_probability(base_prob, score, elig)
+    conf = _confidence_label(0.55 + 0.35 * abs(prob - 0.5) * 2)
+    reasons = [
+        f"M2 macrophage z-score: {m2:+.2f}",
+        f"MDSC proxy z-score: {mdsc:+.2f}",
+        f"M2 polarization z-score: {m2_pol:+.2f}",
+    ]
+    recs.append(DrugRecommendation("Pexidartinib", "CSF1R inhibitor", prob, conf, reasons))
+
+    # 3) CXCR1/2 inhibitor
+    elig = cxcl1 > -0.1
+    score = _sigmoid(1.1 * cxcl1 + 0.5 * mdsc + 0.2 * il6)
+    prob = _combine_probability(base_prob, score, elig)
+    conf = _confidence_label(0.55 + 0.35 * abs(prob - 0.5) * 2)
+    reasons = [
+        f"CXCL1-MDSC axis z-score: {cxcl1:+.2f}",
+        f"MDSC proxy z-score: {mdsc:+.2f}",
+        f"IL6-STAT3 axis z-score: {il6:+.2f}",
+    ]
+    recs.append(DrugRecommendation("Reparixin", "CXCR1/2 inhibitor", prob, conf, reasons))
+
+    # 4) TGF-beta pathway inhibitor
+    elig = stromal_barrier > 0.0
+    score = _sigmoid(1.2 * tgfb + 0.7 * excl + 0.4 * caf)
+    prob = _combine_probability(base_prob, score, elig)
+    conf = _confidence_label(0.55 + 0.35 * abs(prob - 0.5) * 2)
+    reasons = [
+        f"TGF-beta activity z-score: {tgfb:+.2f}",
+        f"CAF proxy z-score: {caf:+.2f}",
+        f"Immune exclusion z-score: {excl:+.2f}",
+    ]
+    recs.append(DrugRecommendation("Galunisertib", "TGF-beta inhibitor", prob, conf, reasons))
+
+    # 5) Anti-VEGF option
+    elig = angiogenic_stress > -0.1
+    score = _sigmoid(1.3 * angiogenic_stress + 0.3 * hypoxia)
+    prob = _combine_probability(base_prob, score, elig)
+    conf = _confidence_label(0.55 + 0.35 * abs(prob - 0.5) * 2)
+    reasons = [
+        f"Hypoxia score z: {hypoxia:+.2f}",
+        f"IL6-STAT3 axis z-score: {il6:+.2f}",
+        f"Angiogenic stress index: {angiogenic_stress:+.2f}",
+    ]
+    recs.append(DrugRecommendation("Bevacizumab", "VEGF inhibitor", prob, conf, reasons))
+
+    # 6) Cytotoxic fallback
+    elig = True
+    score = _sigmoid(0.5 * angiogenic_stress - 0.2 * stromal_barrier)
+    prob = _combine_probability(base_prob, score, elig)
+    conf = _confidence_label(0.55 + 0.35 * abs(prob - 0.5) * 2)
+    reasons = [
+        f"Angiogenic stress index: {angiogenic_stress:+.2f}",
+        f"Stromal barrier index: {stromal_barrier:+.2f}",
+        "Fallback option when targeted TME effects are uncertain",
+    ]
+    recs.append(DrugRecommendation("Paclitaxel", "Chemotherapy", prob, conf, reasons))
+
+    return sorted(recs, key=lambda r: r.probability, reverse=True)
+
+
+def _render_markdown(
+    patient_id: str,
+    base_prob: float,
+    recs: list[DrugRecommendation],
+    model_name: str,
+    top_k: int = 3,
+) -> str:
     lines = [
         f"# DrugResponce Treatment Ranking - {patient_id}",
         "",
+        f"Model type: {model_name}",
         f"Base model response probability: {base_prob * 100:.1f}%",
         "",
         "Recommended Treatments:",
@@ -226,39 +344,50 @@ def _render_markdown(patient_id: str, base_prob: float, recs: list[DrugRecommend
     return "\n".join(lines) + "\n"
 
 
-def recommend_for_patient(patient_id: str, top_k: int = 3) -> tuple[float, list[DrugRecommendation], str]:
+def recommend_for_patient(patient_id: str, model_name: str = "baseline", top_k: int = 3) -> tuple[float, list[DrugRecommendation], str]:
     """Generate ranked treatment options for one patient.
 
     Args:
         patient_id: Patient identifier.
+        model_name: Model variant (`baseline` or `tme`).
         top_k: Number of top drugs to include in report.
 
     Returns:
         Tuple of (base response probability, sorted recommendations, markdown report path).
     """
     pid = normalize_patient_id(patient_id)
-    clinical = pd.read_csv(PROCESSED_DIR / "clinical_cleaned.csv", index_col=0)
-    tme = pd.read_csv(PROCESSED_DIR / "tme_features.csv", index_col=0)
-    expr = pd.read_csv(PROCESSED_DIR / "rnaseq_processed.csv", index_col=0)
-    X_full = pd.read_csv(PROCESSED_DIR / "X_full.csv", index_col=0)
+    if model_name not in {"baseline", "tme"}:
+        raise ValueError("model_name must be one of: baseline, tme")
 
-    if pid not in X_full.index:
+    X_model = pd.read_csv(PROCESSED_DIR / f"X_{model_name}.csv", index_col=0)
+
+    if pid not in X_model.index:
         raise KeyError(f"Patient {pid} is not present in processed dataset")
 
     _prepare_openmp_runtime()
-    with (METRICS_DIR / "full_final_model.pkl").open("rb") as f:
+    with (METRICS_DIR / f"{model_name}_final_model.pkl").open("rb") as f:
         model = pickle.load(f)
 
-    base_prob = float(model.predict_proba(X_full.loc[[pid]])[:, 1][0])
-    recs = _build_drug_scores(pid, base_prob, clinical, tme, expr)
+    base_prob = float(model.predict_proba(X_model.loc[[pid]])[:, 1][0])
+    if model_name == "tme":
+        tme = pd.read_csv(PROCESSED_DIR / "tme_features.csv", index_col=0)
+        missing = [col for col in TME_COLUMNS if col not in tme.columns]
+        if missing:
+            raise KeyError(f"Missing TME columns for recommendation: {missing}")
+        recs = _build_drug_scores_tme(pid, base_prob, tme)
+    else:
+        clinical = pd.read_csv(PROCESSED_DIR / "clinical_cleaned.csv", index_col=0)
+        expr = pd.read_csv(PROCESSED_DIR / "rnaseq_processed.csv", index_col=0)
+        recs = _build_drug_scores_baseline(pid, base_prob, clinical, expr)
 
     RECOMMEND_DIR.mkdir(parents=True, exist_ok=True)
-    md_text = _render_markdown(pid, base_prob, recs, top_k=top_k)
-    md_path = RECOMMEND_DIR / f"{pid}_recommendations.md"
+    md_text = _render_markdown(pid, base_prob, recs, model_name=model_name, top_k=top_k)
+    md_path = RECOMMEND_DIR / f"{pid}_{model_name}_recommendations.md"
     md_path.write_text(md_text, encoding="utf-8")
 
     json_payload = {
         "patient_id": pid,
+        "model_name": model_name,
         "base_model_probability": base_prob,
         "recommendations": [
             {
@@ -271,7 +400,7 @@ def recommend_for_patient(patient_id: str, top_k: int = 3) -> tuple[float, list[
             for r in recs
         ],
     }
-    with (RECOMMEND_DIR / f"{pid}_recommendations.json").open("w", encoding="utf-8") as f:
+    with (RECOMMEND_DIR / f"{pid}_{model_name}_recommendations.json").open("w", encoding="utf-8") as f:
         json.dump(json_payload, f, indent=2)
 
     return base_prob, recs, str(md_path)
@@ -283,14 +412,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Generate drug recommendations for a patient")
     parser.add_argument("--patient-id", default=None, help="Patient ID (TCGA-XX-XXXX style)")
     parser.add_argument("--top-k", type=int, default=3)
+    parser.add_argument("--model", choices=["baseline", "tme"], default="baseline")
     args = parser.parse_args()
 
-    X_full = pd.read_csv(PROCESSED_DIR / "X_full.csv", index_col=0)
-    pid = normalize_patient_id(args.patient_id) if args.patient_id else str(X_full.index[0])
+    X_model = pd.read_csv(PROCESSED_DIR / f"X_{args.model}.csv", index_col=0)
+    pid = normalize_patient_id(args.patient_id) if args.patient_id else str(X_model.index[0])
 
-    base_prob, recs, out_path = recommend_for_patient(pid, top_k=args.top_k)
+    base_prob, recs, out_path = recommend_for_patient(pid, model_name=args.model, top_k=args.top_k)
     logging.info("Recommendations saved to %s", out_path)
-    logging.info("\\n%s", _render_markdown(pid, base_prob, recs, top_k=args.top_k))
+    logging.info("\\n%s", _render_markdown(pid, base_prob, recs, model_name=args.model, top_k=args.top_k))
 
 
 if __name__ == "__main__":

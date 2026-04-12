@@ -232,7 +232,16 @@ def _prepare_clinical_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     pcr_from_input = out["pCR"].map(_encode_binary_status)
     pcr_from_event = event_source.map(_encode_no_event_response)
-    out["pCR"] = pcr_from_event.combine_first(pcr_from_input)
+    out["pCR"] = pcr_from_input
+    missing_pcr = out["pCR"].isna()
+    if missing_pcr.any() and pcr_from_event.notna().any():
+        fill_count = int((missing_pcr & pcr_from_event.notna()).sum())
+        if fill_count > 0:
+            out.loc[missing_pcr, "pCR"] = pcr_from_event.loc[missing_pcr]
+            logging.warning(
+                "Filled %d missing pCR labels using recurrence proxy (NO event -> responder).",
+                fill_count,
+            )
 
     dfs_event_from_input = out["DFS_event"].map(_encode_binary_status)
     dfs_event_from_event = event_source.map(_encode_binary_status)
@@ -532,7 +541,12 @@ def main() -> None:
     ensure_raw_data_available(RNASEQ_FILE, CLINICAL_FILE)
 
     rnaseq = load_rnaseq(str(RNASEQ_FILE))
-    clinical_source = XENA_CLINICAL_MATRIX_FILE if XENA_CLINICAL_MATRIX_FILE.exists() else CLINICAL_FILE
+    if CLINICAL_FILE.exists():
+        clinical_source = CLINICAL_FILE
+    elif XENA_CLINICAL_MATRIX_FILE.exists():
+        clinical_source = XENA_CLINICAL_MATRIX_FILE
+    else:
+        clinical_source = CLINICAL_FILE
     logging.info("Using clinical source: %s", clinical_source)
     clinical = load_clinical(str(clinical_source))
     merged = merge_datasets(rnaseq, clinical)

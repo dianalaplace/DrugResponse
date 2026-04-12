@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import logging
 from pathlib import Path
 
@@ -38,7 +39,9 @@ TME_FEATURES = [
 ]
 
 
-def build_feature_matrix(clinical: pd.DataFrame, tme_features: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.DataFrame]:
+def build_feature_matrix(
+    clinical: pd.DataFrame, tme_features: pd.DataFrame | None = None
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Series, pd.DataFrame]:
     """Build baseline and full matrices for ablation.
 
     Args:
@@ -46,7 +49,7 @@ def build_feature_matrix(clinical: pd.DataFrame, tme_features: pd.DataFrame) -> 
         tme_features: TME feature dataframe indexed by patient_id.
 
     Returns:
-        Tuple of (X_baseline, X_full, y_pcr, y_survival).
+        Tuple of (X_baseline, X_full, X_tme, y_pcr, y_survival).
     """
     for col in GENOMIC_CLINICAL_FEATURES + ["pCR", "DFS_months", "DFS_event"]:
         if col not in clinical.columns:
@@ -54,20 +57,26 @@ def build_feature_matrix(clinical: pd.DataFrame, tme_features: pd.DataFrame) -> 
 
     X_baseline = clinical[GENOMIC_CLINICAL_FEATURES].copy()
 
-    missing_tme = [c for c in TME_FEATURES if c not in tme_features.columns]
-    if missing_tme:
-        logging.warning("Missing TME features in matrix; filling zeros: %s", missing_tme)
-        for col in missing_tme:
-            tme_features[col] = 0.0
+    if tme_features is None or tme_features.empty:
+        logging.info("TME features disabled; using baseline features only for full matrix placeholder.")
+        X_tme = pd.DataFrame(index=X_baseline.index)
+        X_full = X_baseline.copy()
+    else:
+        missing_tme = [c for c in TME_FEATURES if c not in tme_features.columns]
+        if missing_tme:
+            logging.warning("Missing TME features in matrix; filling zeros: %s", missing_tme)
+            for col in missing_tme:
+                tme_features[col] = 0.0
+        X_tme = tme_features[TME_FEATURES].copy()
+        tme_subset = X_tme.copy()
+        X_full = X_baseline.join(tme_subset, how="inner")
 
-    tme_subset = tme_features[TME_FEATURES].copy()
-    X_full = X_baseline.join(tme_subset, how="inner")
-
-    y_raw = pd.to_numeric(clinical.loc[X_full.index, "pCR"], errors="coerce")
-    # Fallback target for sparse pCR availability: no recurrence as responder.
-    if y_raw.dropna().nunique() < 2 and "DFS_event" in clinical.columns:
-        y_raw = 1.0 - pd.to_numeric(clinical.loc[X_full.index, "DFS_event"], errors="coerce")
-        logging.warning("pCR had insufficient class diversity; using 1-DFS_event as response proxy target.")
+    target_index = X_full.index if not X_full.empty else X_baseline.index
+    y_raw = pd.to_numeric(clinical.loc[target_index, "pCR"], errors="coerce")
+    if y_raw.dropna().nunique() < 2:
+        raise ValueError(
+            "pCR has insufficient class diversity. Refusing to use DFS proxy target to avoid endpoint leakage."
+        )
 
     valid_idx = y_raw[y_raw.isin([0.0, 1.0])].index
     if len(valid_idx) < 100:
@@ -75,16 +84,17 @@ def build_feature_matrix(clinical: pd.DataFrame, tme_features: pd.DataFrame) -> 
 
     X_baseline = X_baseline.loc[valid_idx]
     X_full = X_full.loc[valid_idx]
+    X_tme = X_tme.loc[valid_idx]
     y_pcr = y_raw.loc[valid_idx].astype(int)
     y_survival = clinical.loc[valid_idx, ["DFS_months", "DFS_event"]].copy()
 
-    assert len(X_baseline) == len(X_full) == len(y_pcr) == len(y_survival)
+    assert len(X_baseline) == len(X_full) == len(X_tme) == len(y_pcr) == len(y_survival)
     class_counts = y_pcr.value_counts().to_dict()
     if len(class_counts) < 2:
         raise ValueError("Binary response target has a single class after filtering.")
     logging.info("Response target distribution after filtering: %s", class_counts)
 
-    return X_baseline, X_full, y_pcr, y_survival
+    return X_baseline, X_full, X_tme, y_pcr, y_survival
 
 
 def preprocess_features(X: pd.DataFrame) -> pd.DataFrame:
@@ -131,30 +141,44 @@ def main() -> None:
         None
     """
     configure_logging()
+    parser = argparse.ArgumentParser(description="Build model feature matrices")
+    parser.add_argument(
+        "--use-tme",
+        action="store_true",
+        help="Include TME features in X_full (disabled by default for baseline-only mode).",
+    )
+    args = parser.parse_args()
 
     clinical_path = PROCESSED_DIR / "clinical_cleaned.csv"
     tme_path = PROCESSED_DIR / "tme_features.csv"
 
     if not clinical_path.exists():
         raise FileNotFoundError(f"Missing clinical file: {clinical_path}")
-    if not tme_path.exists():
-        raise FileNotFoundError(f"Missing TME feature file: {tme_path}")
-
     clinical = pd.read_csv(clinical_path, index_col=0)
-    tme = pd.read_csv(tme_path, index_col=0)
+    if args.use_tme and tme_path.exists():
+        tme = pd.read_csv(tme_path, index_col=0)
+    elif args.use_tme and not tme_path.exists():
+        raise FileNotFoundError(f"Requested --use-tme but missing file: {tme_path}")
+    else:
+        tme = pd.DataFrame(index=clinical.index)
 
-    X_baseline, X_full, y_pcr, y_survival = build_feature_matrix(clinical, tme)
+    X_baseline, X_full, X_tme, y_pcr, y_survival = build_feature_matrix(clinical, tme)
 
     X_baseline_p = preprocess_features(X_baseline)
     X_full_p = preprocess_features(X_full)
+    X_tme_p = preprocess_features(X_tme) if not X_tme.empty else X_tme
 
     X_baseline_p.to_csv(PROCESSED_DIR / "X_baseline.csv")
     X_full_p.to_csv(PROCESSED_DIR / "X_full.csv")
+    if not X_tme_p.empty:
+        X_tme_p.to_csv(PROCESSED_DIR / "X_tme.csv")
     y_pcr.to_csv(PROCESSED_DIR / "y_pcr.csv", header=["pCR"])
     y_survival.to_csv(PROCESSED_DIR / "y_survival.csv")
 
     logging.info("Saved baseline features to %s", PROCESSED_DIR / "X_baseline.csv")
     logging.info("Saved full features to %s", PROCESSED_DIR / "X_full.csv")
+    if not X_tme_p.empty:
+        logging.info("Saved TME-only features to %s", PROCESSED_DIR / "X_tme.csv")
     logging.info("Saved pCR labels to %s", PROCESSED_DIR / "y_pcr.csv")
     logging.info("Saved survival labels to %s", PROCESSED_DIR / "y_survival.csv")
 
