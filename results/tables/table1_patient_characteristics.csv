@@ -1,9 +1,0 @@
-Cohort,Dataset,N,pCR_n,pCR_rate,Platform,Endpoint
-All subtypes (chemo),GSE25065+GSE20194,476,98,20.6%,Affymetrix HG-U133A,Neoadjuvant pCR
-TNBC (chemo),GSE25065+GSE20194,137,45,32.8%,Affymetrix HG-U133A,Neoadjuvant pCR
-Non-TNBC (chemo),GSE25065+GSE20194,339,53,15.6%,Affymetrix HG-U133A,Neoadjuvant pCR
-HR+ / ER-positive (chemo),GSE25065+GSE20194,287,29,10.1%,Affymetrix HG-U133A,Neoadjuvant pCR
-HER2-positive (chemo),GSE25065+GSE20194,61,23,37.7%,Affymetrix HG-U133A,Neoadjuvant pCR
-I-SPY2 All (immuno),GSE173839,100,36,36.0%,Agilent 44K + biomarkers,Neoadjuvant pCR
-I-SPY2 Durvalumab arm,GSE173839,71,29,40.8%,Agilent 44K + biomarkers,Neoadjuvant pCR
-I-SPY2 Control arm,GSE173839,29,7,24.1%,Agilent 44K + biomarkers,Neoadjuvant pCR

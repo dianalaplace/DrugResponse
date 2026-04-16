@@ -5,3 +5,6 @@ __pycache__/
 results/
 data/processed/
 data/raw/
+node_modules/
+*.log
+.ipynb_checkpoints/
