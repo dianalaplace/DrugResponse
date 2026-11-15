@@ -1,0 +1,27 @@
+GSE25065: n=198, unlabeled=16, probes=22283, expr range -5.03..21.03, median 8.21
+GSE20194: n=278, unlabeled=0, probes=22283, expr range -3.16..20.07, median 7.83
+cross-cohort max sample corr: 0.9349; pairs >0.98: 0
+within GSE25065 max off-diag corr: 0.9478; 99th pct of cross-cohort max: 0.9130
+pooled: n=460, pCR rate=0.213, clinical=8, probes=22215
+
+Plain 5-fold CV (fixed C, no tuning):
+  clinical LR, C=1                   AUC(seed42)=0.745  PR-AUC=0.420  AUC over 5 CV seeds: 0.740 ± 0.003
+  clinical LR, C=0.1                 AUC(seed42)=0.746  PR-AUC=0.421  AUC over 5 CV seeds: 0.741 ± 0.003
+  clinical+500 probes LR, C=0.01     AUC(seed42)=0.785  PR-AUC=0.500  AUC over 5 CV seeds: 0.771 ± 0.008
+  clinical+500 probes LR, C=0.001    AUC(seed42)=0.785  PR-AUC=0.475  AUC over 5 CV seeds: 0.778 ± 0.006
+  clinical+genes OOF AUC within cohort 0: 0.759
+  clinical+genes OOF AUC within cohort 1: 0.803
+
+Cross-cohort (train one, test other), clinical+500 probes, C=0.01 / clinical only C=1:
+  train 0 -> test 1  clinical    AUC=0.772
+  train 0 -> test 1  clin+genes  AUC=0.718
+  train 1 -> test 0  clinical    AUC=0.681
+  train 1 -> test 0  clin+genes  AUC=0.749
+
+Shuffled-label sanity (clinical+500 probes, C=0.01), 5 permutations:
+  AUCs: [0.524 0.506 0.568 0.555 0.482] mean=0.527
+  GSE25065 dlda30_prediction: values=[np.str_('RD'), np.str_('pCR')], AUC as predictor=0.610
+  GSE25065 rcb_0_i_prediction: values=[np.str_('RCB-0/I'), np.str_('RCB-II/III')], AUC as predictor=0.579
+  GSE25065 pathologic_response_rcb_class: values=[np.str_('NA'), np.str_('RCB-0/I'), np.str_('RCB-II'), np.str_('RCB-III')], AUC as predictor=0.742
+
+GSE20194 treatment codes: {np.str_(''): np.int64(7), np.str_('FAC'): np.int64(3), np.str_('FACT'): np.int64(1), np.str_('FACT+XRT/X'): np.int64(1), np.str_('FEC'): np.int64(1), np.str_('FECT'): np.int64(2), np.str_('NA'): np.int64(1), np.str_('TFAC'): np.int64(210), np.str_('TFAC/HT'): np.int64(1), np.str_('TFEC'): np.int64(33), np.str_('TH/FAC'): np.int64(6), np.str_('TH/FEC'): np.int64(2), np.str_('TXFAC'): np.int64(9), np.str_('Tonly'): np.int64(1)}

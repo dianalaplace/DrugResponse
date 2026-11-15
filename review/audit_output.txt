@@ -1,0 +1,36 @@
+GSE25065: (198, 24) (198, 22283)
+GSE20194: (278, 16) (278, 22283)
+GSE25065: n=198, pCR rate=0.231, missing labels=16
+GSE20194: n=278, pCR rate=0.205, missing labels=10
+Pooled cohort: 450 patients, 8 clinical + 22215 probe features
+pCR rate: 0.216
+Feature columns used (clinical): ['age', 'er', 'pr', 'her2', 't_stage', 'n_stage', 'grade', 'cohort']
+Any leaky column in X?: none
+X columns == clinical + probes only: True
+pCR rate by cohort: {0: 0.231, 1: 0.205}
+
+GSE20194 samples with >=1 misparsed field: 20 / 278
+misparsed count per field: {'age': 1, 'er_status': 9, 'pr_status': 10, 'her2 status': 20, 'tbefore': 10, 'nbefore': 10, 'bmngrd': 13, 'pcr_vs_rd': 10}
+example notebook-parsed rows:
+           age er_status pr_status her2 status tbefore nbefore bmngrd pcr_vs_rd
+GSM505436  48         P         P         NEG       4       1      3       pCR
+GSM505452  36         P         P          ND       2       1      2        RD
+GSM505470  40         N         N           0       3       1      0        RD
+GSM505484  55         P         N         NEG       2       0      2        RD
+same rows, correct:
+           age er_status pr_status her2 status tbefore nbefore bmngrd pcr_vs_rd
+GSM505436  48         P         P           N       4       1      3       pCR
+GSM505452  36         P         P           N       2       1      2        RD
+GSM505470  40         N         N           N       3       1    NaN        RD
+GSM505484  55         P         N           N       2       0      2        RD
+notebook grade values in GSE20194: [np.float64(0.0), np.float64(1.0), np.float64(2.0), np.float64(3.0)]
+notebook t_stage values GSE20194: [np.float64(0.0), np.float64(1.0), np.float64(2.0), np.float64(3.0), np.float64(4.0)] | GSE25065: [np.int64(0), np.int64(1), np.int64(2), np.int64(3), np.int64(4)]
+samples dropped as 'unlabeled' in GSE20194: 10; true labels of those: {0: 9, 1: 1}
+
+Model B AUC (rerun) = 0.780; chosen params per outer fold: [{'clf__C': 0.001, 'prep__genes__select__k': 500}, {'clf__C': 0.001, 'prep__genes__select__k': 500}, {'clf__C': 0.01, 'prep__genes__select__k': 500}, {'clf__C': 0.01, 'prep__genes__select__k': 500}, {'clf__C': 0.01, 'prep__genes__select__k': 200}]
+Model A AUC (rerun) = 0.752; chosen params: [{'clf__C': 0.01}, {'clf__C': 0.01}, {'clf__C': 0.01}, {'clf__C': 0.01}, {'clf__C': 0.01}]
+Model B nested-CV AUC with shuffled y (3 perms): [0.535 0.532 0.525]
+
+Correct parse: n=460, pCR rate=0.213
+  A_clinical_LR on correctly parsed data: AUC = 0.744
+  B_clinical_genes_LR on correctly parsed data: AUC = 0.763

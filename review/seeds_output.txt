@@ -1,0 +1,5 @@
+A_clinical_LR: AUC per seed [0.756 0.757 0.743 0.748 0.752] mean 0.751 ± 0.005
+B_clinical_genes_LR: AUC per seed [0.762 0.738 0.765 0.785 0.78 ] mean 0.766 ± 0.017
+Delta B-A per seed: [ 0.006 -0.019  0.022  0.037  0.028]
+TNBC model B AUC 0.664, 95% CI 0.560-0.764, n=120, pCR=43
+HER2+ by cohort: {1: 55, 0: 2}
