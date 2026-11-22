@@ -1,0 +1,4 @@
+model,ROC-AUC,95% CI,PR-AUC,Brier
+A_clinical_LR,0.744,0.692–0.793,0.406,0.208
+B_clinical_genes_LR,0.782,0.725–0.831,0.501,0.17
+C_clinical_genes_XGB,0.781,0.730–0.827,0.459,0.149

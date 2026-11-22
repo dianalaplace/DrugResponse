@@ -485,8 +485,17 @@ def run_shap(model_name: str, model: object, feature_matrix: pd.DataFrame, outpu
         return payload
 
     sample = feature_matrix.sample(min(len(feature_matrix), max_samples), random_state=RANDOM_STATE)
-    explainer = shap.TreeExplainer(model)
-    shap_values = explainer.shap_values(sample)
+    try:
+        shap_values = shap.TreeExplainer(model).shap_values(sample)
+        method = "shap.TreeExplainer"
+    except Exception as exc:  # some shap/xgboost version pairs are incompatible
+        # XGBoost computes the same TreeSHAP values natively; the last column is the bias term.
+        import xgboost as xgb
+
+        contribs = model.get_booster().predict(xgb.DMatrix(sample), pred_contribs=True)
+        shap_values = contribs[:, :-1]
+        method = f"xgboost pred_contribs (shap failed: {type(exc).__name__}: {exc})"
+        logging.warning("SHAP via shap.TreeExplainer failed, used XGBoost pred_contribs instead: %s", exc)
     if isinstance(shap_values, list):
         shap_values = shap_values[1]
     if getattr(shap_values, "ndim", 0) == 3:
@@ -494,6 +503,7 @@ def run_shap(model_name: str, model: object, feature_matrix: pd.DataFrame, outpu
     importance = pd.Series(np.abs(np.asarray(shap_values)).mean(axis=0), index=sample.columns).sort_values(ascending=False)
     payload = {
         "model": model_name,
+        "method": method,
         "top_features": [{"feature": feature, "mean_abs_shap": float(value)} for feature, value in importance.head(20).items()],
     }
     _save_json(payload, output_dir / "shap" / f"{model_name}_shap.json")

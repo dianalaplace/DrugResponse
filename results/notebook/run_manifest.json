@@ -1,0 +1,44 @@
+{
+  "produced_by": "notebooks/DrugResponse_full.ipynb (executed end-to-end with nbconvert)",
+  "run_date": "2026-11-22",
+  "python": "3.13.18",
+  "packages": {
+    "numpy": "2.5.3",
+    "pandas": "2.3.3",
+    "scikit-learn": "1.9.1",
+    "xgboost": "3.4.1",
+    "shap": "0.54.1",
+    "matplotlib": "3.11.2"
+  },
+  "data": {
+    "GSE25065_series_matrix.txt.gz": {
+      "md5": "267d0787fcf9f28feec0f50499a902e1",
+      "source": "https://ftp.ncbi.nlm.nih.gov/geo/series/GSE25nnn/GSE25065/matrix/"
+    },
+    "GSE20194_series_matrix.txt.gz": {
+      "md5": "1f43fd165c8b417368f21ac90821a028",
+      "source": "https://ftp.ncbi.nlm.nih.gov/geo/series/GSE20nnn/GSE20194/matrix/"
+    },
+    "GPL96.annot.gz": {
+      "note": "GEO annotation, Annotation_date Aug 09 2016; used only to map probe IDs to gene symbols for SHAP labels"
+    }
+  },
+  "cohort": {
+    "n_patients": 460,
+    "GSE25065": 182,
+    "GSE20194": 278,
+    "pcr_rate": 0.213,
+    "clinical_features": 8,
+    "probe_features": 22215
+  },
+  "cv": {
+    "outer_folds": 5,
+    "inner_folds": 3,
+    "random_state": 42,
+    "bootstrap_resamples": 1000
+  },
+  "shap": {
+    "model": "C_clinical_genes_XGB refit on all patients",
+    "method": "shap.TreeExplainer; falls back to xgboost pred_contribs (identical TreeSHAP values) if the shap/xgboost versions are incompatible"
+  }
+}
