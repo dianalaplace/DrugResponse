@@ -1,0 +1,4 @@
+subtype,n,pCR rate,A_clinical_LR,B_clinical_genes_LR,C_clinical_genes_XGB
+HR+/HER2-,268,0.112,0.689,0.703,0.702
+HER2+,61,0.377,0.667,0.693,0.757
+TNBC,129,0.349,0.559,0.774,0.725
